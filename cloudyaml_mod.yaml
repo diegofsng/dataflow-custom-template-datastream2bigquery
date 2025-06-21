@@ -1,0 +1,117 @@
+# Google Cloud Build script for Cloud Teleport
+#
+# This build script is used to build the open-source Cloud Teleport GitHub repository for every
+# change pushed. The .m2 directory is cached across steps using a mounted volume and is saved to GCS
+# for future runs.
+#
+# Manual Execution:
+# Use the below command to invoke the build manually. Note the substitutions for BRANCH_NAME and
+# REVISION_ID. These variables are normally populated when the build is executed via build triggers
+# but will be empty during manual execution. Dummy branch and revisions can be passed during manual
+# execution so the artifacts can be uploaded upon build completion.
+#
+# gcloud builds submit . \
+#   --config=cloudbuild.yaml \
+#   --substitutions=BRANCH_NAME="master",REVISION_ID="bd671f47ce9e95dce00d0c07aee08f46d65658e4"
+#
+
+# modified by Diegofasan
+
+steps:
+###########################################################
+# Step 1: Retrieve the cached .m2 directory from GCS
+###########################################################
+- name: 'gcr.io/cloud-builders/gsutil'
+  id: 'GetM2Cache'
+  args:
+  - '-m'
+  - 'rsync'
+  - '-r'
+  - 'gs://${_BUCKET}/cache/.m2'
+  - '/cache/.m2'
+  volumes:
+  - path: '/cache/.m2'
+    name: 'm2_cache'
+
+###########################################################
+# Step 2: Build and package the JAR.
+#         This setup is the same as the Readme file in the DataflowTemplates repository.
+#         Consider that the line 47 ('-DskipTests') can be removed if it is needed to test 
+#         the build. This command will generate the Jar file of the repository.
+###########################################################
+
+- name: 'gcr.io/cloud-builders/mvn'
+  id: 'BuildAndPackageJar' # Added ID for waitFor
+  args:
+  - 'clean'
+  - 'package'
+  - '-DskipTests' # remove if needed to test repository integrity
+  - '-Dimage=${_IMAGE_TAG}'
+  - '-Dbase-container-image=${_BASE_IMAGE}'
+  - '-Dbase-container-image.version=${_IMAGE_VERSION_TAG}'
+  - '-Dapp-root=/template/'
+  - '-Dcommand-spec=/template/metadata.json'
+  - '-am'
+  - '-pl'
+  - 'v2/datastream-to-bigquery'
+  volumes:
+  - path: '/cache/.m2'
+    name: 'm2_cache'
+  env:
+  - MAVEN_OPTS=-Dmaven.repo.local=/cache/.m2
+
+
+###########################################################
+# Step 3: Update cached .m2 directory on GCS with any
+#         additional dependencies downloaded during the
+#         build.
+###########################################################
+- name: 'gcr.io/cloud-builders/gsutil'
+  id: 'UpdateM2Cache'
+  args:
+  - '-m'
+  - 'rsync'
+  - '-r'
+  - '/cache/.m2'
+  - 'gs://${_BUCKET}/cache/.m2/'
+  volumes:
+  - path: '/cache/.m2'
+    name: 'm2_cache'
+
+
+###########################################################
+# Step 4: Build and upload the Docker image
+###########################################################
+- name: 'gcr.io/cloud-builders/docker'
+  id: 'BuildDockerImage'
+  script: |
+    docker build -t ${_IMAGE_TAG} .
+  automapSubstitutions: true
+- name: 'gcr.io/cloud-builders/docker'
+  id: 'PushDockerImage'
+  script: |
+    docker push ${_IMAGE_TAG}
+  automapSubstitutions: true
+
+
+substitutions:
+  # Default values
+  _BUCKET: '<CLOUD_BUCKET_NAME>' # without gs:// prefix
+  _IMAGE_TAG : '<DOCKER_IMAGE_TAG>' # Tag of the docker image. Should be something similar to LOCATION-docker.pkg.dev/PROJECT-ID/REPOSITORY/IMAGE
+  _IMAGE_VERSION_TAG: 'latest' # you should tag the image according to your requirements. Please modify this to version docker images.
+  _BASE_IMAGE: 'gcr.io/dataflow-templates-base/java17-template-launcher-base' # you can modify Java version here
+
+
+images:
+- '<DOCKER_IMAGE_TAG>' # this should map the upper value of DOCKER_IMAGE_TAG
+
+artifacts:
+  # Upload the jars created during the build.
+  objects:
+    # location in cloud storage where the JAR files will be uploaded.
+    location: 'gs://${_BUCKET}/artifacts/$BRANCH_NAME/$REVISION_ID'
+    paths: ['v2/datastream-to-bigquery/target/*.jar']
+# v2/datastream-to-bigquery/src/main/java/com/google/cloud/teleport/v2/templates/DataStreamToBigQuery.java
+options:
+  # Use higher CPU machines so the caching and build steps are faster.
+  machineType: 'E2_HIGHCPU_32'
